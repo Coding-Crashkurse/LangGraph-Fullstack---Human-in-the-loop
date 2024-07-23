@@ -9,7 +9,11 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 import uvicorn
+from fastapi.middleware.cors import CORSMiddleware
+
 
 DATABASE_URL = "sqlite+aiosqlite:///./test.db"
 
@@ -20,9 +24,24 @@ SessionLocal = sessionmaker(
 )
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins, modify this as needed
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    with open("static/index.html") as f:
+        return HTMLResponse(content=f.read(), status_code=200)
 
 
 # Models
