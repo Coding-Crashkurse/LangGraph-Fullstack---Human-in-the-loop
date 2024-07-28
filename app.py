@@ -1,28 +1,24 @@
-# Import necessary modules and packages
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, select, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import selectinload
-from pydantic import BaseModel, field_validator
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, selectinload
+from pydantic import BaseModel, validator
 from datetime import datetime, timedelta
 from typing import Optional, List
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
-DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+DATABASE_URL = "sqlite:///./test.db"
 
 Base = declarative_base()
-engine = create_async_engine(DATABASE_URL, echo=True)
-SessionLocal = sessionmaker(
-    autocommit=False, autoflush=False, bind=engine, class_=AsyncSession
-)
+engine = create_engine(DATABASE_URL, echo=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 app = FastAPI()
 app.add_middleware(
@@ -40,12 +36,11 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_index():
+def serve_index():
     with open("static/index.html") as f:
         return HTMLResponse(content=f.read(), status_code=200)
 
 
-# Models
 class User(Base):
     __tablename__ = "users"
 
@@ -53,6 +48,7 @@ class User(Base):
     name = Column(String, unique=True, index=True)
     hashed_password = Column(String)
     is_admin = Column(Boolean, default=False)
+    admin_decision = Column(String, nullable=True)
     user_contract = relationship(
         "UserContract", back_populates="user", uselist=False, lazy="selectin"
     )
@@ -87,7 +83,7 @@ class ContractCreate(BaseModel):
     category: str
     user_id: int
 
-    @field_validator("category")
+    @validator("category")
     def category_must_be_valid(cls, v):
         if v not in ["basic", "normal", "premium"]:
             raise ValueError("Category must be one of: basic, normal, premium")
@@ -97,7 +93,7 @@ class ContractCreate(BaseModel):
 class ContractUpdate(BaseModel):
     category: Optional[str] = None
 
-    @field_validator("category")
+    @validator("category")
     def category_must_be_valid(cls, v):
         if v and v not in ["basic", "normal", "premium"]:
             raise ValueError("Category must be one of: basic, normal, premium")
@@ -118,25 +114,26 @@ class ConfirmAction(BaseModel):
 
 
 # Dependencies
-async def get_db():
-    async with SessionLocal() as session:
-        yield session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
-async def get_user_by_name(db: AsyncSession, name: str):
-    result = await db.execute(select(User).filter(User.name == name))
-    return result.scalar()
+def get_user_by_name(db: Session, name: str):
+    return db.query(User).filter(User.name == name).first()
 
 
-async def get_user_by_id(db: AsyncSession, user_id: int):
-    result = await db.execute(select(User).filter(User.id == user_id))
-    return result.scalar()
+def get_user_by_id(db: Session, user_id: int):
+    return db.query(User).filter(User.id == user_id).first()
 
 
-async def get_current_user(
-    db: AsyncSession = Depends(get_db), token: str = Depends(oauth2_scheme)
+def get_current_user(
+    db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)
 ):
-    user = await get_user_by_name(db, token)
+    user = get_user_by_name(db, token)
     if user is None:
         raise HTTPException(
             status_code=401, detail="Invalid authentication credentials"
@@ -144,10 +141,10 @@ async def get_current_user(
     return user
 
 
-async def get_current_admin_user(
-    db: AsyncSession = Depends(get_db), token: str = Depends(oauth2_scheme)
+def get_current_admin_user(
+    db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)
 ):
-    user = await get_current_user(db, token)
+    user = get_current_user(db, token)
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Not authorized")
     return user
@@ -184,76 +181,73 @@ async def notify_clients(message: dict):
 
 # Routes
 @app.post("/register/")
-async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
-    db_user = await get_user_by_name(db, user.name)
+def register(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = get_user_by_name(db, user.name)
     if db_user:
         raise HTTPException(status_code=400, detail="Username already registered")
     hashed_password = get_password_hash(user.password)
     new_user = User(name=user.name, hashed_password=hashed_password)
     db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
+    db.commit()
+    db.refresh(new_user)
     return new_user
 
 
 @app.post("/token/")
-async def login(
-    form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)
 ):
-    user = await get_user_by_name(db, form_data.username)
+    user = get_user_by_name(db, form_data.username)
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Incorrect username or password")
     return {"access_token": user.name, "token_type": "bearer"}
 
 
 @app.post("/contracts/")
-async def create_contract(
+def create_contract(
     contract: ContractCreate,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
     current_admin_user: User = Depends(get_current_admin_user),
 ):
-    user = await get_user_by_id(db, contract.user_id)
+    user = get_user_by_id(db, contract.user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    existing_contract = await db.execute(
-        select(UserContract).filter(UserContract.user_id == contract.user_id)
+    existing_contract = (
+        db.query(UserContract).filter(UserContract.user_id == contract.user_id).first()
     )
-    if existing_contract.scalar():
+    if existing_contract:
         raise HTTPException(status_code=400, detail="User already has a contract")
 
-    contract_category = await db.execute(
-        select(Contract).filter_by(category=contract.category)
-    )
-    contract_record = contract_category.scalar()
-    if not contract_record:
+    contract_category = db.query(Contract).filter_by(category=contract.category).first()
+    if not contract_category:
         raise HTTPException(status_code=404, detail="Contract category not found")
 
     new_user_contract = UserContract(
         user_id=contract.user_id,
-        contract_id=contract_record.id,
+        contract_id=contract_category.id,
         contract_time=datetime.utcnow(),
     )
     db.add(new_user_contract)
-    await db.commit()
-    await db.refresh(new_user_contract)
+    db.commit()
+    db.refresh(new_user_contract)
 
     return {
         "id": new_user_contract.id,
-        "category": contract_record.category,
+        "category": contract_category.category,
         "contract_time": new_user_contract.contract_time,
         "user_id": new_user_contract.user_id,
     }
 
 
 @app.put("/contracts/{contract_id}/")
-async def update_contract(
+def update_contract(
     contract_id: int,
     contract: ContractUpdate,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
     current_admin_user: User = Depends(get_current_admin_user),
 ):
-    db_contract = await db.get(UserContract, contract_id)
+    db_contract = db.query(UserContract).get(contract_id)
     if not db_contract:
         raise HTTPException(status_code=404, detail="Contract not found")
     if db_contract.user_id != current_admin_user.id:
@@ -262,18 +256,18 @@ async def update_contract(
         )
     for key, value in contract.dict(exclude_unset=True).items():
         setattr(db_contract, key, value)
-    await db.commit()
-    await db.refresh(db_contract)
+    db.commit()
+    db.refresh(db_contract)
     return db_contract
 
 
 @app.delete("/contracts/{contract_id}/")
-async def delete_contract(
+def delete_contract(
     contract_id: int,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
     current_admin_user: User = Depends(get_current_admin_user),
 ):
-    db_contract = await db.get(UserContract, contract_id)
+    db_contract = db.query(UserContract).get(contract_id)
     if not db_contract:
         raise HTTPException(status_code=404, detail="Contract not found")
     if db_contract.user_id != current_admin_user.id:
@@ -281,7 +275,7 @@ async def delete_contract(
             status_code=403, detail="Not authorized to delete this contract"
         )
     db_contract.contract_time = datetime.utcnow() + timedelta(days=90)
-    await db.commit()
+    db.commit()
 
     return {"detail": "Contract will be cancelled in 3 months"}
 
@@ -293,88 +287,81 @@ async def ask_admin(request: AskAdmin):
     return {"message": "Admin approval requested"}
 
 
-import asyncio
-
-
 @app.post("/confirm_action/")
-async def confirm_action(request: ConfirmAction, db: AsyncSession = Depends(get_db)):
-    # Simulate waiting for admin confirmation status
-    while True:
-        if not request.confirmed:
-            await asyncio.sleep(1)  # Sleep to simulate waiting for actual admin input
-            continue
+def confirm_action(request: ConfirmAction, db: Session = Depends(get_db)):
+    user = get_user_by_name(db, request.username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-        if request.action == "create":
-            user = await get_user_by_name(db, request.username)
-            if not user:
-                raise HTTPException(status_code=404, detail="User not found")
+    if not request.confirmed:
+        user.admin_decision = "denied"
+        db.commit()
+        db.refresh(user)
+        return {"message": "Admin denied the request"}
 
-            contract_category = await db.execute(
-                select(Contract).filter_by(category=request.category)
-            )
-            contract_record = contract_category.scalar()
-            if not contract_record:
-                raise HTTPException(
-                    status_code=404, detail="Contract category not found"
-                )
+    user.admin_decision = "confirmed"
+    db.commit()
+    db.refresh(user)
 
-            new_user_contract = UserContract(
-                user_id=user.id,
-                contract_id=contract_record.id,
-                contract_time=datetime.utcnow(),
-            )
-            db.add(new_user_contract)
-            await db.commit()
-            await db.refresh(new_user_contract)
+    if request.action == "create":
+        contract_category = (
+            db.query(Contract).filter_by(category=request.category).first()
+        )
+        if not contract_category:
+            raise HTTPException(status_code=404, detail="Contract category not found")
 
-            return {
-                "message": "Contract created",
-                "id": new_user_contract.id,
-                "category": contract_record.category,
-                "contract_time": new_user_contract.contract_time,
-                "user_id": new_user_contract.user_id,
-            }
-        elif request.action == "delete":
-            user = await get_user_by_name(db, request.username)
-            if not user or not user.user_contract:
-                raise HTTPException(
-                    status_code=404, detail="User or contract not found"
-                )
+        new_user_contract = UserContract(
+            user_id=user.id,
+            contract_id=contract_category.id,
+            contract_time=datetime.utcnow(),
+        )
+        db.add(new_user_contract)
+        db.commit()
+        db.refresh(new_user_contract)
 
-            db_contract = user.user_contract
-            db_contract.contract_time = datetime.utcnow() + timedelta(days=90)
-            await db.commit()
+        return {
+            "message": "Contract created",
+            "id": new_user_contract.id,
+            "category": contract_category.category,
+            "contract_time": new_user_contract.contract_time,
+            "user_id": new_user_contract.user_id,
+        }
+    elif request.action == "delete":
+        if not user.user_contract:
+            raise HTTPException(status_code=404, detail="User or contract not found")
 
-            return {"message": "Contract will be cancelled in 3 months"}
+        db_contract = user.user_contract
+        db_contract.contract_time = datetime.utcnow() + timedelta(days=90)
+        db.commit()
+        return {"message": "Contract will be cancelled in 3 months"}
 
-        return {"message": "Action not recognized"}
+    return {"message": "Action not recognized"}
 
 
 @app.get("/users/")
-async def get_all_users(
-    db: AsyncSession = Depends(get_db),
+def get_all_users(
+    db: Session = Depends(get_db),
     current_admin_user: User = Depends(get_current_admin_user),
 ):
-    result = await db.execute(
-        select(User).options(
-            selectinload(User.user_contract).selectinload(UserContract.contract)
-        )
+    users = (
+        db.query(User)
+        .options(selectinload(User.user_contract).selectinload(UserContract.contract))
+        .all()
     )
-    users = result.scalars().all()
     return users
 
 
 @app.get("/users/{username}")
-async def get_user_by_username(username: str, db: AsyncSession = Depends(get_db)):
-    user = await get_user_by_name(db, username)
+def get_user_by_username(username: str, db: Session = Depends(get_db)):
+    user = get_user_by_name(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
 
 @app.get("/contracts/user/{username}")
-async def get_contract_by_username(username: str, db: AsyncSession = Depends(get_db)):
-    user = await get_user_by_name(db, username)
+def get_contract_by_username(username: str, db: Session = Depends(get_db)):
+    user = get_user_by_name(db, username)
     if not user or not user.user_contract:
         return JSONResponse(content={"message": "No contract"}, status_code=404)
     return {
@@ -385,51 +372,66 @@ async def get_contract_by_username(username: str, db: AsyncSession = Depends(get
     }
 
 
-# Use this endpoint to send the status of admin confirmation
 @app.get("/check_confirmation/{username}")
-async def check_confirmation(username: str, db: AsyncSession = Depends(get_db)):
-    user = await get_user_by_name(db, username)
+def check_confirmation(username: str, db: Session = Depends(get_db)):
+    user = (
+        db.query(User)
+        .options(selectinload(User.user_contract).selectinload(UserContract.contract))
+        .filter(User.name == username)
+        .first()
+    )
+
     if user and user.user_contract:
         contract = user.user_contract
+        # Reset admin decision after checking
+        user.admin_decision = None
+        db.commit()
+        db.refresh(user)  # Ensure user is refreshed after resetting admin decision
+
         return {
             "message": "Contract created",
             "id": contract.id,
-            "category": contract.contract.category,
+            "category": contract.contract.category,  # This should now be pre-loaded
             "contract_time": contract.contract_time,
             "user_id": contract.user_id,
         }
+
+    if user and user.admin_decision == "denied":
+        # Reset admin decision after checking
+        user.admin_decision = None
+        db.commit()
+        db.refresh(user)  # Ensure user is refreshed after resetting admin decision
+        return {"message": "Admin denied the request"}
+
     return {"message": "Waiting for admin confirmation"}
 
 
 @app.on_event("startup")
-async def startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+def startup():
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    categories = ["basic", "normal", "premium"]
+    for category in categories:
+        existing_contract = db.query(Contract).filter_by(category=category).first()
+        if not existing_contract:
+            new_contract = Contract(category=category)
+            db.add(new_contract)
+    db.commit()
 
-    async with SessionLocal() as db:
-        categories = ["basic", "normal", "premium"]
-        for category in categories:
-            existing_contract = await db.execute(
-                select(Contract).filter_by(category=category)
-            )
-            if not existing_contract.scalar():
-                new_contract = Contract(category=category)
-                db.add(new_contract)
-        await db.commit()
+    admin1 = get_user_by_name(db, "admin1")
+    if not admin1:
+        hashed_password = get_password_hash("admin1password")
+        admin1 = User(name="admin1", hashed_password=hashed_password, is_admin=True)
+        db.add(admin1)
 
-        admin1 = await get_user_by_name(db, "admin1")
-        if not admin1:
-            hashed_password = get_password_hash("admin1password")
-            admin1 = User(name="admin1", hashed_password=hashed_password, is_admin=True)
-            db.add(admin1)
+    admin2 = get_user_by_name(db, "admin2")
+    if not admin2:
+        hashed_password = get_password_hash("admin2password")
+        admin2 = User(name="admin2", hashed_password=hashed_password, is_admin=True)
+        db.add(admin2)
 
-        admin2 = await get_user_by_name(db, "admin2")
-        if not admin2:
-            hashed_password = get_password_hash("admin2password")
-            admin2 = User(name="admin2", hashed_password=hashed_password, is_admin=True)
-            db.add(admin2)
-
-        await db.commit()
+    db.commit()
+    db.close()
 
 
 if __name__ == "__main__":
