@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+# Import necessary modules and packages
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, select, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
@@ -13,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
-
+from fastapi.responses import JSONResponse
 
 DATABASE_URL = "sqlite+aiosqlite:///./test.db"
 
@@ -82,15 +83,6 @@ class UserCreate(BaseModel):
     password: str
 
 
-class UserOut(BaseModel):
-    id: int
-    name: str
-    is_admin: bool
-
-    class Config:
-        from_attributes = True
-
-
 class ContractCreate(BaseModel):
     category: str
     user_id: int
@@ -102,16 +94,6 @@ class ContractCreate(BaseModel):
         return v
 
 
-class ContractOut(BaseModel):
-    id: int
-    category: str
-    contract_time: datetime
-    user_id: int
-
-    class Config:
-        from_attributes = True
-
-
 class ContractUpdate(BaseModel):
     category: Optional[str] = None
 
@@ -120,6 +102,19 @@ class ContractUpdate(BaseModel):
         if v and v not in ["basic", "normal", "premium"]:
             raise ValueError("Category must be one of: basic, normal, premium")
         return v
+
+
+class AskAdmin(BaseModel):
+    action: str
+    username: str
+    category: Optional[str] = None
+
+
+class ConfirmAction(BaseModel):
+    action: str
+    username: str
+    category: Optional[str] = None
+    confirmed: bool
 
 
 # Dependencies
@@ -167,8 +162,28 @@ def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
 
+clients = []
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    clients.append(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            # Process incoming WebSocket messages if needed
+    except WebSocketDisconnect:
+        clients.remove(websocket)
+
+
+async def notify_clients(message: dict):
+    for client in clients:
+        await client.send_json(message)
+
+
 # Routes
-@app.post("/register/", response_model=UserOut)
+@app.post("/register/")
 async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
     db_user = await get_user_by_name(db, user.name)
     if db_user:
@@ -191,7 +206,7 @@ async def login(
     return {"access_token": user.name, "token_type": "bearer"}
 
 
-@app.post("/contracts/", response_model=ContractOut)
+@app.post("/contracts/")
 async def create_contract(
     contract: ContractCreate,
     db: AsyncSession = Depends(get_db),
@@ -231,7 +246,7 @@ async def create_contract(
     }
 
 
-@app.put("/contracts/{contract_id}/", response_model=ContractOut)
+@app.put("/contracts/{contract_id}/")
 async def update_contract(
     contract_id: int,
     contract: ContractUpdate,
@@ -267,17 +282,123 @@ async def delete_contract(
         )
     db_contract.contract_time = datetime.utcnow() + timedelta(days=90)
     await db.commit()
+
     return {"detail": "Contract will be cancelled in 3 months"}
 
 
-@app.get("/users/", response_model=List[UserOut])
+@app.post("/ask_admin/")
+async def ask_admin(request: AskAdmin):
+    message = request.dict()
+    await notify_clients(message)
+    return {"message": "Admin approval requested"}
+
+
+import asyncio
+
+
+@app.post("/confirm_action/")
+async def confirm_action(request: ConfirmAction, db: AsyncSession = Depends(get_db)):
+    # Simulate waiting for admin confirmation status
+    while True:
+        if not request.confirmed:
+            await asyncio.sleep(1)  # Sleep to simulate waiting for actual admin input
+            continue
+
+        if request.action == "create":
+            user = await get_user_by_name(db, request.username)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            contract_category = await db.execute(
+                select(Contract).filter_by(category=request.category)
+            )
+            contract_record = contract_category.scalar()
+            if not contract_record:
+                raise HTTPException(
+                    status_code=404, detail="Contract category not found"
+                )
+
+            new_user_contract = UserContract(
+                user_id=user.id,
+                contract_id=contract_record.id,
+                contract_time=datetime.utcnow(),
+            )
+            db.add(new_user_contract)
+            await db.commit()
+            await db.refresh(new_user_contract)
+
+            return {
+                "message": "Contract created",
+                "id": new_user_contract.id,
+                "category": contract_record.category,
+                "contract_time": new_user_contract.contract_time,
+                "user_id": new_user_contract.user_id,
+            }
+        elif request.action == "delete":
+            user = await get_user_by_name(db, request.username)
+            if not user or not user.user_contract:
+                raise HTTPException(
+                    status_code=404, detail="User or contract not found"
+                )
+
+            db_contract = user.user_contract
+            db_contract.contract_time = datetime.utcnow() + timedelta(days=90)
+            await db.commit()
+
+            return {"message": "Contract will be cancelled in 3 months"}
+
+        return {"message": "Action not recognized"}
+
+
+@app.get("/users/")
 async def get_all_users(
     db: AsyncSession = Depends(get_db),
     current_admin_user: User = Depends(get_current_admin_user),
 ):
-    result = await db.execute(select(User))
+    result = await db.execute(
+        select(User).options(
+            selectinload(User.user_contract).selectinload(UserContract.contract)
+        )
+    )
     users = result.scalars().all()
     return users
+
+
+@app.get("/users/{username}")
+async def get_user_by_username(username: str, db: AsyncSession = Depends(get_db)):
+    user = await get_user_by_name(db, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+@app.get("/contracts/user/{username}")
+async def get_contract_by_username(username: str, db: AsyncSession = Depends(get_db)):
+    user = await get_user_by_name(db, username)
+    if not user or not user.user_contract:
+        return JSONResponse(content={"message": "No contract"}, status_code=404)
+    return {
+        "id": user.user_contract.id,
+        "category": user.user_contract.contract.category,
+        "contract_time": user.user_contract.contract_time,
+        "user_id": user.id,
+    }
+
+
+# Use this endpoint to send the status of admin confirmation
+@app.get("/check_confirmation/{username}")
+async def check_confirmation(username: str, db: AsyncSession = Depends(get_db)):
+    user = await get_user_by_name(db, username)
+    if user and user.user_contract:
+        contract = user.user_contract
+        return {
+            "message": "Contract created",
+            "id": contract.id,
+            "category": contract.contract.category,
+            "contract_time": contract.contract_time,
+            "user_id": contract.user_id,
+        }
+    return {"message": "Waiting for admin confirmation"}
 
 
 @app.on_event("startup")

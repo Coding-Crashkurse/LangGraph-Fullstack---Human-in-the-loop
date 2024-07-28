@@ -28,6 +28,26 @@
             border: 1px solid #ddd;
             background-color: #f9f9f9;
         }
+
+        .popup {
+            display: none;
+            position: fixed;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            padding: 20px;
+            border: 1px solid #ddd;
+            background-color: #fff;
+            box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .popup h3 {
+            margin: 0 0 10px 0;
+        }
+
+        .popup button {
+            margin-top: 10px;
+        }
     </style>
 </head>
 
@@ -60,7 +80,19 @@
         <p id="register-message"></p>
     </div>
 
+    <!-- Popup for creating/deleting contracts -->
+    <div class="popup" id="contract-popup">
+        <h3 id="popup-title"></h3>
+        <p id="popup-message"></p>
+        <button id="popup-confirm">Confirm</button>
+        <button id="popup-deny">Deny</button>
+    </div>
+
     <script>
+        let currentAction = null;
+        let currentUsername = null;
+        let currentCategory = null;
+
         async function fetchUsersAndContracts() {
             try {
                 const response = await fetch('http://127.0.0.1:8000/users/', {
@@ -94,6 +126,70 @@
             }
         }
 
+        function showPopup(action, username, category = null) {
+            currentAction = action;
+            currentUsername = username;
+            currentCategory = category;
+
+            const popup = document.getElementById('contract-popup');
+            const title = document.getElementById('popup-title');
+            const message = document.getElementById('popup-message');
+
+            if (action === 'create') {
+                title.textContent = 'Create Contract';
+                message.textContent = `Are you sure you want to create a ${category} contract for ${username}?`;
+            } else if (action === 'delete') {
+                title.textContent = 'Delete Contract';
+                message.textContent = `Are you sure you want to delete the contract for ${username}?`;
+            }
+
+            popup.style.display = 'block';
+        }
+
+        function hidePopup() {
+            const popup = document.getElementById('contract-popup');
+            popup.style.display = 'none';
+            currentAction = null;
+            currentUsername = null;
+            currentCategory = null;
+        }
+
+        document.getElementById('popup-confirm').addEventListener('click', async () => {
+            await handleUserDecision(true);
+        });
+
+        document.getElementById('popup-deny').addEventListener('click', async () => {
+            await handleUserDecision(false);
+        });
+
+        <!-- Add these lines to your existing frontend code -->
+        async function handleUserDecision(confirmed) {
+            const action = currentAction;
+            const username = currentUsername;
+            const category = currentCategory;
+
+            hidePopup();
+
+            const response = await fetch('http://127.0.0.1:8000/confirm_action/', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ action: action, username: username, category: category, confirmed: confirmed })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                console.error(`Error: ${errorData.message}`);
+                return;
+            }
+
+            const result = await response.json();
+            console.log(result.message);
+            fetchUsersAndContracts();
+        }
+
+
         async function registerUser(event) {
             event.preventDefault();
             const username = document.getElementById('username').value;
@@ -118,17 +214,30 @@
 
                 const result = await response.json();
                 messageElement.textContent = `User ${result.name} registered successfully!`;
-                fetchUsersAndContracts(); // Refresh the user list
+                fetchUsersAndContracts();
             } catch (error) {
                 console.error('Error registering user:', error);
             }
         }
 
-        // Fetch users and contracts when the page loads
         window.onload = fetchUsersAndContracts;
 
-        // Register form submit event listener
         document.getElementById('register-form').addEventListener('submit', registerUser);
+
+        const ws = new WebSocket('ws://127.0.0.1:8000/ws');
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            showPopup(data.action, data.username, data.category);
+        };
+
+        ws.onopen = () => {
+            console.log('WebSocket connection established.');
+        };
+
+        ws.onclose = () => {
+            console.log('WebSocket connection closed.');
+        };
     </script>
 </body>
 
