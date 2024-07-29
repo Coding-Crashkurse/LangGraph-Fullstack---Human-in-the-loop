@@ -293,6 +293,10 @@ def confirm_action(request: ConfirmAction, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    print(
+        f"confirm_action: Received request to {request.action} for user {request.username} with confirmation {request.confirmed}"
+    )
+
     if not request.confirmed:
         user.admin_decision = "denied"
         db.commit()
@@ -381,28 +385,53 @@ def check_confirmation(username: str, db: Session = Depends(get_db)):
         .first()
     )
 
-    if user and user.user_contract:
-        contract = user.user_contract
-        # Reset admin decision after checking
-        user.admin_decision = None
-        db.commit()
-        db.refresh(user)  # Ensure user is refreshed after resetting admin decision
+    if not user:
+        print(f"check_confirmation: User '{username}' not found.")
+        return {"message": "User not found"}
 
-        return {
-            "message": "Contract created",
-            "id": contract.id,
-            "category": contract.contract.category,  # This should now be pre-loaded
-            "contract_time": contract.contract_time,
-            "user_id": contract.user_id,
-        }
+    # Reset admin decision after checking
+    user_decision = user.admin_decision
+    user.admin_decision = None
+    db.commit()
+    db.refresh(user)
 
-    if user and user.admin_decision == "denied":
-        # Reset admin decision after checking
-        user.admin_decision = None
-        db.commit()
-        db.refresh(user)  # Ensure user is refreshed after resetting admin decision
+    print(
+        f"check_confirmation: Admin decision for user '{username}' is '{user_decision}'."
+    )
+
+    if user_decision == "denied":
+        print(f"check_confirmation: Admin denied the request for user '{username}'.")
         return {"message": "Admin denied the request"}
 
+    if user.user_contract:
+        contract = user.user_contract
+
+        if user_decision == "confirmed":
+            # Check if the contract is marked for deletion in the future
+            if contract.contract_time <= datetime.utcnow() + timedelta(days=90):
+                print(
+                    f"check_confirmation: Contract for user '{username}' confirmed for deletion."
+                )
+                return {
+                    "message": "Contract will be cancelled in 3 months",
+                    "id": contract.id,
+                    "category": contract.contract.category,
+                    "contract_time": contract.contract_time,
+                    "user_id": contract.user_id,
+                }
+            else:
+                print(
+                    f"check_confirmation: Contract for user '{username}' confirmed as created."
+                )
+                return {
+                    "message": "Contract created",
+                    "id": contract.id,
+                    "category": contract.contract.category,
+                    "contract_time": contract.contract_time,
+                    "user_id": contract.user_id,
+                }
+
+    print(f"check_confirmation: Waiting for admin confirmation for user '{username}'.")
     return {"message": "Waiting for admin confirmation"}
 
 
