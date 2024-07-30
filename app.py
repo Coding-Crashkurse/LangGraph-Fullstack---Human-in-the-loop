@@ -203,6 +203,23 @@ def login(
     return {"access_token": user.name, "token_type": "bearer"}
 
 
+@app.get("/contracts/user/{username}")
+def get_contract_by_username(username: str, db: Session = Depends(get_db)):
+    user = get_user_by_name(db, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not user.user_contract:
+        raise HTTPException(status_code=404, detail="No contract found for this user")
+
+    contract_details = {
+        "id": user.user_contract.id,
+        "category": user.user_contract.contract.category,
+        "contract_time": user.user_contract.contract_time,
+        "user_id": user.id,
+    }
+    return contract_details
+
+
 @app.post("/contracts/")
 def create_contract(
     contract: ContractCreate,
@@ -330,16 +347,6 @@ def confirm_action(request: ConfirmAction, db: Session = Depends(get_db)):
             "contract_time": new_user_contract.contract_time,
             "user_id": new_user_contract.user_id,
         }
-    elif request.action == "delete":
-        if not user.user_contract:
-            raise HTTPException(status_code=404, detail="User or contract not found")
-
-        db_contract = user.user_contract
-        db_contract.contract_time = datetime.utcnow() + timedelta(days=90)
-        db.commit()
-        return {"message": "Contract will be cancelled in 3 months"}
-
-    return {"message": "Action not recognized"}
 
 
 @app.get("/users/")
@@ -363,19 +370,6 @@ def get_user_by_username(username: str, db: Session = Depends(get_db)):
     return user
 
 
-@app.get("/contracts/user/{username}")
-def get_contract_by_username(username: str, db: Session = Depends(get_db)):
-    user = get_user_by_name(db, username)
-    if not user or not user.user_contract:
-        return JSONResponse(content={"message": "No contract"}, status_code=404)
-    return {
-        "id": user.user_contract.id,
-        "category": user.user_contract.contract.category,
-        "contract_time": user.user_contract.contract_time,
-        "user_id": user.id,
-    }
-
-
 @app.get("/check_confirmation/{username}")
 def check_confirmation(username: str, db: Session = Depends(get_db)):
     user = (
@@ -389,8 +383,9 @@ def check_confirmation(username: str, db: Session = Depends(get_db)):
         print(f"check_confirmation: User '{username}' not found.")
         return {"message": "User not found"}
 
-    # Reset admin decision after checking
+    # Capture the current admin decision
     user_decision = user.admin_decision
+    # Reset admin decision to prevent stale state
     user.admin_decision = None
     db.commit()
     db.refresh(user)
@@ -399,37 +394,55 @@ def check_confirmation(username: str, db: Session = Depends(get_db)):
         f"check_confirmation: Admin decision for user '{username}' is '{user_decision}'."
     )
 
+    # If the admin denied the request
     if user_decision == "denied":
         print(f"check_confirmation: Admin denied the request for user '{username}'.")
         return {"message": "Admin denied the request"}
 
+    if not user.user_contract:
+        if user_decision == "confirmed":
+            print(
+                f"check_confirmation: No contract found for user '{username}', approved to create."
+            )
+            return {
+                "message": "Contract created"
+            }  # Indicate a contract should be created
+        print(
+            f"check_confirmation: No contract found for user '{username}', awaiting approval."
+        )
+        return {"message": "No Contract, awaiting approval"}
+
     if user.user_contract:
         contract = user.user_contract
 
-        if user_decision == "confirmed":
-            # Check if the contract is marked for deletion in the future
-            if contract.contract_time <= datetime.utcnow() + timedelta(days=90):
-                print(
-                    f"check_confirmation: Contract for user '{username}' confirmed for deletion."
-                )
-                return {
-                    "message": "Contract will be cancelled in 3 months",
-                    "id": contract.id,
-                    "category": contract.contract.category,
-                    "contract_time": contract.contract_time,
-                    "user_id": contract.user_id,
-                }
-            else:
-                print(
-                    f"check_confirmation: Contract for user '{username}' confirmed as created."
-                )
-                return {
-                    "message": "Contract created",
-                    "id": contract.id,
-                    "category": contract.contract.category,
-                    "contract_time": contract.contract_time,
-                    "user_id": contract.user_id,
-                }
+        # Determine if the contract is newly created or set for deletion
+        contract_age = datetime.utcnow() - contract.contract_time
+
+        # Consider a contract "new" if it was just created within a reasonable timeframe, e.g., a minute
+        if user_decision == "confirmed" and contract_age.total_seconds() < 60:
+            print(
+                f"check_confirmation: Contract for user '{username}' confirmed as created."
+            )
+            return {
+                "message": "Contract created",
+                "id": contract.id,
+                "category": contract.contract.category,
+                "contract_time": contract.contract_time,
+                "user_id": contract.user_id,
+            }
+
+        # If the contract is marked for deletion (i.e., contract_time + 90 days is in the future)
+        if contract.contract_time + timedelta(days=90) >= datetime.utcnow():
+            print(
+                f"check_confirmation: Contract for user '{username}' confirmed for deletion."
+            )
+            return {
+                "message": "Contract will be cancelled in 3 months",
+                "id": contract.id,
+                "category": contract.contract.category,
+                "contract_time": contract.contract_time,
+                "user_id": contract.user_id,
+            }
 
     print(f"check_confirmation: Waiting for admin confirmation for user '{username}'.")
     return {"message": "Waiting for admin confirmation"}
